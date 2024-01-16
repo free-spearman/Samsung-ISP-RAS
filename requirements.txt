@@ -1,9 +1,9 @@
-pycocotools==2.0.7
+pycocotools
 opencv-contrib-python-headless
-kornia==0.7.0
+torchvision
 -e git+https://github.com/cheind/py-thin-plate-spline.git#egg=thinplate
-tqdm==4.65.0
-wget==3.2
-torch==2.1.1
-torchvision==0.16.1
-numpy==1.23.5
+torch
+kornia
+numpy
+tqdm
+wget
