@@ -211,6 +211,7 @@ def get_ap_metrics(coco_diction: list, dataset_coco: COCODataset, ids: list[int]
         _, tmp = tempfile.mkstemp()
         json.dump(coco_diction, open(tmp, "w"))
         coco_dt = coco_gt.loadRes(tmp)
+        print(coco_dt)
         coco_eval = COCOeval(dataset_coco, coco_dt, ann_type[1])
         coco_eval.params.imgIds = ids
         coco_eval.evaluate()

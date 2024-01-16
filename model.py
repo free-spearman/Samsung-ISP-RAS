@@ -11,7 +11,7 @@ import yaml
 from torch.autograd import Variable
 
 import coco_dataset as coco_dataset
-import dataset_utils as dataset_utils
+import utils as dataset_utils
 import yolo3_utils as yolo3_utils
 
 
@@ -473,12 +473,8 @@ class YOLOV3Multi(nn.Module):
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda x: yolo3_utils.burnin_schedule(x, self.cfg))
 
         losses = []
-        pp = 0
         for _ in range(epochs):
             for imgs_info in loader:
-                pp+=1
-                if pp > 5:
-                    break
                 optimizer.zero_grad()
                 imgs = Variable(imgs_info[0].type(dtype))
                 targets = Variable(imgs_info[1].type(dtype), requires_grad=False)
@@ -496,10 +492,13 @@ class YOLOV3Multi(nn.Module):
     def predict(
         self,
         images: np.array,
-        confidence: float = 0.9,
-        num_classes: int = 8,
+        info_images: Optional[list] = None,
+        confidence: float = 0.7,
+        nms_thre: float = 0.45,
+        num_classes: int = 80,
         need_eval: bool = False,
         id_images: Optional[List] = None,
+        preprocess: bool = True,
     ) -> Union[list, tuple[list, list]]:
         """Get model predictions on one image."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -509,27 +508,32 @@ class YOLOV3Multi(nn.Module):
         colors = np.random.uniform(0, 255, size=(len(coco_class_names), 3))
         font = cv2.FONT_HERSHEY_PLAIN
 
-        process_images = []
-        info_images = []
+        if preprocess:
+            process_images = []
+            info_images = []
 
         for image in images:
-            image = image.astype("int32")
-            sized, info_img = dataset_utils.preprocess(image, 640, 0, random_placing=False)
-            info_images.append(info_img)
-            im_test = sized.transpose(2, 0, 1) / 255.0
-            im_test = im_test.astype("float32")
-            process_images.append(im_test)
-        process_images = np.stack(process_images)
+            if preprocess:
+                image = image.astype("int32")
+                sized, info_img = dataset_utils.preprocess(image, 640, 0, random_placing=False)
+                im_test = sized.transpose(2, 0, 1) / 255.0
+                im_test = im_test.astype("float32")
+                process_images.append(im_test)
+                info_images.append(info_img)
+
+        if preprocess:
+            process_images = np.stack(process_images)
+        else:
+            process_images = images
 
         with torch.no_grad():
-            outputs = self.model(torch.tensor(process_images).to(device).float().clone())
-            post_outputs = dataset_utils.postprocess(outputs, num_classes, conf_thre=confidence)
+            outputs = self.model(torch.tensor(process_images).to(device).float().clone(), device=device)
+            post_outputs = dataset_utils.postprocess(outputs, num_classes, conf_thre=confidence, nms_thre=nms_thre)
 
         batch_result_images = []
         batch_result_data_dict = []
 
         for k in range(len(post_outputs)):
-            print(f"k = {k}")
             image = images[k]
             if not (post_outputs[k] is None):
                 bboxes = []
@@ -540,8 +544,6 @@ class YOLOV3Multi(nn.Module):
 
                 for x1, y1, x2, y2, conf, cls_conf, cls_pred in post_outputs[k]:
                     cls_id = coco_class_ids[int(cls_pred)]
-                    print(int(x1), int(y1), int(x2), int(y2), float(conf), int(cls_pred))
-                    print("\t+ Label: %s, Conf: %.5f" % (coco_class_names[cls_id], cls_conf.item()))
                     box = dataset_utils.yolobox2label([y1, x1, y2, x2], info_images[k])
                     bboxes.append([e.cpu() for e in box])
 
@@ -551,8 +553,8 @@ class YOLOV3Multi(nn.Module):
 
                     if need_eval:
                         label = coco_class_ids[int(cls_pred)]
-                        box = dataset_utils.yolobox2label((float(y1), float(x1), float(y2), float(x2)), info_img)
-                        bbox = [box[1], box[0], box[3] - box[1], box[2] - box[0]]
+                        box = dataset_utils.yolobox2label((float(y1), float(x1), float(y2), float(x2)), info_images[k])
+                        bbox = [box[1].item(), box[0].item(), box[3].item() - box[1].item(), box[2].item() - box[0].item()]
                         score = float(conf.data.item() * cls_conf.data.item())  # object score * class score
                         results_info = {
                             "image_id": id_images[k],
@@ -563,7 +565,7 @@ class YOLOV3Multi(nn.Module):
                         }  # COCO json format
                         data_dict.append(results_info)
 
-                batch_result_data_dict.append(data_dict)
+                batch_result_data_dict += data_dict
 
                 for i in range(len(bboxes)):
                     x, y, w, h = bboxes[i]
@@ -601,10 +603,11 @@ class YOLOV3Multi(nn.Module):
     def coco_evaluate(
         self,
         dataloader: torch.utils.data.DataLoader,
-        confthre: float,
-        nmsthre: float,
         dataset_coco: coco_dataset.COCODataset,
         coco_class_ids: list,
+        confthre: float = 0.7,
+        nmsthre: float = 0.45,
+        num_classes: int = 80,
     ) -> tuple[float, float]:
         """
         COCO average precision (AP) Evaluation.
@@ -616,8 +619,8 @@ class YOLOV3Multi(nn.Module):
             ap50 (float) : calculated COCO AP for IoU=50
         """
         self.model.eval()
-        cuda = torch.cuda.is_available()
-        dtype = torch.cuda.FloatTensor if cuda else torch.FloatTensor
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model.to(device)
         ids = []
         data_dict = []
 
@@ -629,13 +632,13 @@ class YOLOV3Multi(nn.Module):
             _,
             _,
         ) in dataloader:
+
             with torch.no_grad():
-                img = Variable(img.type(dtype)).cpu()
-                outputs = self.model(img)
-                outputs = dataset_utils.postprocess(outputs, 80, confthre, nmsthre)
+                outputs = self.model(torch.tensor(img).to(device).float(), device=device)
+                outputs = dataset_utils.postprocess(outputs, num_classes, conf_thre=confthre, nms_thre=nmsthre)
 
             for k in range(len(outputs)):
-                info_img_k = [float(info) for info in info_img[k].ravel()]
+                info_img_k = info_img[k]
                 id_k = int(id_[k])
                 ids.append(id_k)
 
@@ -651,7 +654,7 @@ class YOLOV3Multi(nn.Module):
                         y2 = float(output[3])
                         label = coco_class_ids[int(output[6])]
                         box = dataset_utils.yolobox2label((y1, x1, y2, x2), info_img_k)
-                        bbox = [box[1], box[0], box[3] - box[1], box[2] - box[0]]
+                        bbox = [box[1].item(), box[0].item(), box[3].item() - box[1].item(), box[2].item() - box[0].item()]
                         score = float(output[4].data.item() * output[5].data.item())  # object score * class score
                         results_info = {
                             "image_id": id_k,
@@ -665,3 +668,60 @@ class YOLOV3Multi(nn.Module):
         ap50, ap50_95 = yolo3_utils.get_ap_metrics(coco_diction=data_dict, dataset_coco=dataset_coco, ids=ids)
 
         return ap50, ap50_95
+
+    def get_losses(
+        self,
+        batched_inputs: torch.Tensor,
+        targets: dict,
+        target_cls: int = 0,
+        special_loss: bool = False,
+        device: str = "cpu",
+    ) -> tuple[dict, torch.Tensor, torch.Tensor, float]:
+        """Get losses."""
+        imgs = batched_inputs.clone()
+        loss_dict = {}
+
+        loss_dark, objectness_dark = self.model(imgs, targets["yolo"], device)
+        for key, val in self.model.loss_dict.items():
+            loss_dict[key] = val
+
+        mean_i_conf = []
+        for i in range(3):
+            objectness_processed = objectness_dark[i].transpose(2, 4)
+            objectness_processed = objectness_processed.view(
+                (
+                    objectness_processed.shape[0],
+                    3 * 85,
+                    objectness_processed.shape[3],
+                    objectness_processed.shape[4],
+                )
+            )
+
+            if objectness_processed.dim() == 3:
+                objectness_processed = objectness_processed.unsqueeze(0)
+            batch = objectness_processed.size(0)
+            assert objectness_processed.size(1) == (5 + 80) * 3
+            h = objectness_processed.size(2)
+            w = objectness_processed.size(3)
+            # transform the output tensor from [batch, 425, 19, 19] to [batch, 80, 1805]
+            output = objectness_processed.reshape(batch, 3, 5 + 80, h * w)  # [batch, 5, 85, 361]
+            output = output.transpose(1, 2).contiguous()  # [batch, 85, 5, 361]
+            output = output.view(batch, 5 + 80, 3 * h * w)  # [batch, 85, 1805]
+            output_objectness = output[:, 4, :]
+
+            if special_loss:
+                max_obj, _ = torch.max(output_objectness, dim=1)
+                mean_i_conf.append(torch.mean(max_obj))
+            else:
+                output = output[:, 5 : 5 + 80, :]  # [batch, 80, 1805]
+                # perform softmax to normalize probabilities for object classes to [0,1]
+                normal_confs = torch.nn.Softmax(dim=1)(output)
+
+                # we only care for probabilities of the class of interest (person)
+                confs_for_class = normal_confs[:, target_cls, :]
+                confs_if_object = output_objectness * confs_for_class
+                max_conf, _ = torch.max(confs_if_object, dim=1)
+                mean_i_conf.append(torch.mean(max_conf))
+        mean_i_conf = torch.stack(mean_i_conf)
+
+        return loss_dict, loss_dark, objectness_dark, mean_i_conf.mean()
